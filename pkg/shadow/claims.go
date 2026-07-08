@@ -44,6 +44,10 @@ func NewClaimManager(client resourceclient.ResourceV1Interface, driverName strin
 	}
 }
 
+func (m *ClaimManager) Client() resourceclient.ResourceV1Interface {
+	return m.client
+}
+
 // ShadowClaimInfo holds the created shadow claim details needed for gRPC calls.
 type ShadowClaimInfo struct {
 	Namespace string

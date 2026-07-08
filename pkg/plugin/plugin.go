@@ -6,12 +6,14 @@ package plugin
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/record"
@@ -267,6 +269,9 @@ func (p *CompositePlugin) prepareClaim(
 		if w.err != nil {
 			p.recorder.Eventf(claim, corev1.EventTypeWarning, "PrepareFailed",
 				"gRPC prepare failed for driver %s: %v", w.shadow.driverName, w.err)
+			if isDeviceConflict(w.err) {
+				p.reportDeviceConflict(ctx, claim, w.allocResult)
+			}
 			p.cleanupShadows(ctx, shadows)
 			return nil, w.err
 		}
@@ -445,4 +450,37 @@ func (p *CompositePlugin) restoreFromState() {
 		p.shadowClaims[uid] = shadows
 	}
 	klog.InfoS("plugin: restored shadow claim records from state", "count", len(records))
+}
+
+func isDeviceConflict(err error) bool {
+	return strings.Contains(err.Error(), "already allocated to different claim")
+}
+
+// reportDeviceConflict writes a DeviceConflict=True condition to the claim's
+// device status, signaling the scheduler to deallocate and re-allocate.
+// Requires DRADeviceBindingConditions + DRAResourceClaimDeviceStatus feature gates.
+func (p *CompositePlugin) reportDeviceConflict(ctx context.Context, claim *resourceapi.ResourceClaim, allocResult resourceapi.DeviceRequestAllocationResult) {
+	deviceStatus := resourceapi.AllocatedDeviceStatus{
+		Driver: allocResult.Driver,
+		Pool:   allocResult.Pool,
+		Device: allocResult.Device,
+		Conditions: []metav1.Condition{
+			{
+				Type:               "DeviceConflict",
+				Status:             metav1.ConditionTrue,
+				LastTransitionTime: metav1.Now(),
+				Reason:             "UnderlyingDeviceAlreadyAllocated",
+				Message:            fmt.Sprintf("Device %s/%s is already allocated to another composition's claim", allocResult.Pool, allocResult.Device),
+			},
+		},
+	}
+
+	claimCopy := claim.DeepCopy()
+	claimCopy.Status.Devices = append(claimCopy.Status.Devices, deviceStatus)
+
+	if _, err := p.claimMgr.Client().ResourceClaims(claim.Namespace).UpdateStatus(ctx, claimCopy, metav1.UpdateOptions{}); err != nil {
+		klog.ErrorS(err, "plugin: failed to report DeviceConflict condition", "claim", claim.Name, "device", allocResult.Device)
+	} else {
+		klog.InfoS("plugin: reported DeviceConflict condition for scheduler retry", "claim", claim.Name, "device", allocResult.Device)
+	}
 }

@@ -72,8 +72,9 @@ func buildSlices(devices []CompositeDevice) []resourceslice.Slice {
 		devs := make([]resourceapi.Device, 0, len(batch))
 		for _, cd := range batch {
 			devs = append(devs, resourceapi.Device{
-				Name:       cd.Name,
-				Attributes: convertAttributes(cd.Attributes),
+				Name:                    cd.Name,
+				Attributes:              convertAttributes(cd.Attributes),
+				BindingFailureConditions: []string{"DeviceConflict"},
 			})
 		}
 		slices = append(slices, resourceslice.Slice{Devices: devs})
@@ -119,8 +120,9 @@ func BuildResourceSlices(driverName, nodeName string, compositeDevices []Composi
 			devs := make([]resourceapi.Device, 0, len(batch))
 			for _, cd := range batch {
 				devs = append(devs, resourceapi.Device{
-					Name:       cd.Name,
-					Attributes: convertAttributes(cd.Attributes),
+					Name:                    cd.Name,
+					Attributes:              convertAttributes(cd.Attributes),
+					BindingFailureConditions: []string{"DeviceConflict"},
 				})
 			}
 
