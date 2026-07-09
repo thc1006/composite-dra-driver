@@ -323,7 +323,6 @@ func (p *CompositePlugin) prepareClaim(
 
 	klog.InfoS("plugin: prepared claim", "namespace", claim.Namespace, "claim", claim.Name, "compositeDevices", len(allDevices), "shadowClaims", len(shadows))
 
-	p.reportDeviceReady(ctx, claim)
 	p.notifyStateChange()
 
 	return allDevices, nil

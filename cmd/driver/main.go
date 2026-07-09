@@ -169,6 +169,8 @@ func main() {
 		}
 	}()
 
+	go plugin.StartBindingWatcher(ctx, kubeClient, compositePlugin)
+
 	go plugin.StartReconciler(ctx, kubeClient.ResourceV1(), cfg.Driver.Name, 5*time.Minute)
 
 	metricsAddr := fmt.Sprintf(":%d", metricsPort)
