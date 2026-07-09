@@ -452,12 +452,14 @@ func (p *CompositePlugin) restoreFromState() {
 	klog.InfoS("plugin: restored shadow claim records from state", "count", len(records))
 }
 
-// reportDeviceReady sets DeviceReady=True on all allocated devices, signaling
-// the scheduler that binding can proceed.
-func (p *CompositePlugin) reportDeviceReady(ctx context.Context, claim *resourceapi.ResourceClaim) {
-	if claim.Status.Allocation == nil {
-		return
-	}
+func isDeviceConflict(err error) bool {
+	return strings.Contains(err.Error(), "already allocated to different claim")
+}
+
+// reportDeviceConflict writes a DeviceConflict=True condition to the claim's
+// device status as a fallback when the binding watcher didn't catch the conflict.
+// Replaces existing device statuses to avoid duplicate deviceID errors.
+func (p *CompositePlugin) reportDeviceConflict(ctx context.Context, claim *resourceapi.ResourceClaim, allocResult resourceapi.DeviceRequestAllocationResult) {
 	var deviceStatuses []resourceapi.AllocatedDeviceStatus
 	for _, result := range claim.Status.Allocation.Devices.Results {
 		if result.Driver != p.driverName {
@@ -469,54 +471,22 @@ func (p *CompositePlugin) reportDeviceReady(ctx context.Context, claim *resource
 			Device: result.Device,
 			Conditions: []metav1.Condition{
 				{
-					Type:               "DeviceReady",
+					Type:               "DeviceConflict",
 					Status:             metav1.ConditionTrue,
 					LastTransitionTime: metav1.Now(),
-					Reason:             "PrepareSucceeded",
-					Message:            "Device prepared successfully",
+					Reason:             "UnderlyingDeviceAlreadyAllocated",
+					Message:            fmt.Sprintf("Device %s/%s is already allocated to another composition's claim", allocResult.Pool, allocResult.Device),
 				},
 			},
 		})
 	}
-	if len(deviceStatuses) == 0 {
-		return
-	}
+
 	claimCopy := claim.DeepCopy()
 	claimCopy.Status.Devices = deviceStatuses
-	if _, err := p.claimMgr.Client().ResourceClaims(claim.Namespace).UpdateStatus(ctx, claimCopy, metav1.UpdateOptions{}); err != nil {
-		klog.ErrorS(err, "plugin: failed to report DeviceReady", "claim", claim.Name)
-	}
-}
-
-func isDeviceConflict(err error) bool {
-	return strings.Contains(err.Error(), "already allocated to different claim")
-}
-
-// reportDeviceConflict writes a DeviceConflict=True condition to the claim's
-// device status, signaling the scheduler to deallocate and re-allocate.
-// Requires DRADeviceBindingConditions + DRAResourceClaimDeviceStatus feature gates.
-func (p *CompositePlugin) reportDeviceConflict(ctx context.Context, claim *resourceapi.ResourceClaim, allocResult resourceapi.DeviceRequestAllocationResult) {
-	deviceStatus := resourceapi.AllocatedDeviceStatus{
-		Driver: allocResult.Driver,
-		Pool:   allocResult.Pool,
-		Device: allocResult.Device,
-		Conditions: []metav1.Condition{
-			{
-				Type:               "DeviceConflict",
-				Status:             metav1.ConditionTrue,
-				LastTransitionTime: metav1.Now(),
-				Reason:             "UnderlyingDeviceAlreadyAllocated",
-				Message:            fmt.Sprintf("Device %s/%s is already allocated to another composition's claim", allocResult.Pool, allocResult.Device),
-			},
-		},
-	}
-
-	claimCopy := claim.DeepCopy()
-	claimCopy.Status.Devices = append(claimCopy.Status.Devices, deviceStatus)
 
 	if _, err := p.claimMgr.Client().ResourceClaims(claim.Namespace).UpdateStatus(ctx, claimCopy, metav1.UpdateOptions{}); err != nil {
-		klog.ErrorS(err, "plugin: failed to report DeviceConflict condition", "claim", claim.Name, "device", allocResult.Device)
+		klog.ErrorS(err, "plugin: failed to report DeviceConflict", "claim", claim.Name, "device", allocResult.Device)
 	} else {
-		klog.InfoS("plugin: reported DeviceConflict condition for scheduler retry", "claim", claim.Name, "device", allocResult.Device)
+		klog.InfoS("plugin: reported DeviceConflict for scheduler retry", "claim", claim.Name, "device", allocResult.Device)
 	}
 }

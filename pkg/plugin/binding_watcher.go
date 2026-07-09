@@ -6,40 +6,73 @@ package plugin
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	resourceapi "k8s.io/api/resource/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
-
-	"github.com/openshift-psap/composite-dra-driver/pkg/store"
 )
 
+type physicalDeviceKey struct {
+	SourceName string
+	Device     string
+}
+
+// bindingWatcher watches ResourceClaims and maintains a physical device
+// reservation map to detect cross-composition conflicts before binding.
+type bindingWatcher struct {
+	plugin *CompositePlugin
+
+	mu          sync.Mutex
+	// physicalDevice → claimUID that reserved it via DeviceReady
+	reservations map[physicalDeviceKey]types.UID
+	// claimUID → physical devices reserved by that claim
+	claimDevices map[types.UID][]physicalDeviceKey
+}
+
 // StartBindingWatcher watches ResourceClaims allocated to this driver and sets
-// binding conditions (DeviceReady or DeviceConflict) based on device availability.
-// This runs independently of the kubelet Prepare path, breaking the chicken-and-egg
-// deadlock between scheduler PreBind and kubelet Prepare.
+// binding conditions (DeviceReady or DeviceConflict) based on physical device
+// availability. Runs independently of kubelet Prepare, breaking the PreBind
+// chicken-and-egg deadlock.
 func StartBindingWatcher(ctx context.Context, kubeClient kubernetes.Interface, plugin *CompositePlugin) {
+	bw := &bindingWatcher{
+		plugin:       plugin,
+		reservations: make(map[physicalDeviceKey]types.UID),
+		claimDevices: make(map[types.UID][]physicalDeviceKey),
+	}
+
 	factory := informers.NewSharedInformerFactory(kubeClient, 0)
 	claimInformer := factory.Resource().V1().ResourceClaims()
 
 	claimInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			claim, ok := obj.(*resourceapi.ResourceClaim)
-			if !ok {
-				return
+			if claim, ok := obj.(*resourceapi.ResourceClaim); ok {
+				bw.handleClaim(ctx, claim)
 			}
-			plugin.handleClaimBinding(ctx, claim)
 		},
 		UpdateFunc: func(_, obj interface{}) {
+			if claim, ok := obj.(*resourceapi.ResourceClaim); ok {
+				bw.handleClaim(ctx, claim)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
 			claim, ok := obj.(*resourceapi.ResourceClaim)
 			if !ok {
-				return
+				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					return
+				}
+				claim, ok = tombstone.Obj.(*resourceapi.ResourceClaim)
+				if !ok {
+					return
+				}
 			}
-			plugin.handleClaimBinding(ctx, claim)
+			bw.releaseClaim(claim.UID)
 		},
 	})
 
@@ -49,15 +82,17 @@ func StartBindingWatcher(ctx context.Context, kubeClient kubernetes.Interface, p
 	<-ctx.Done()
 }
 
-func (p *CompositePlugin) handleClaimBinding(ctx context.Context, claim *resourceapi.ResourceClaim) {
+func (bw *bindingWatcher) handleClaim(ctx context.Context, claim *resourceapi.ResourceClaim) {
+	// Claim deallocated — release reservations
 	if claim.Status.Allocation == nil {
+		bw.releaseClaim(claim.UID)
 		return
 	}
 
-	// Only process claims allocated to our driver
+	// Only process claims with our driver + binding conditions
 	hasOurDevices := false
 	for _, result := range claim.Status.Allocation.Devices.Results {
-		if result.Driver == p.driverName && len(result.BindingConditions) > 0 {
+		if result.Driver == bw.plugin.driverName && len(result.BindingConditions) > 0 {
 			hasOurDevices = true
 			break
 		}
@@ -66,67 +101,96 @@ func (p *CompositePlugin) handleClaimBinding(ctx context.Context, claim *resourc
 		return
 	}
 
-	// Check if we already set conditions on this claim
+	// Already processed — check if we already set conditions
 	if len(claim.Status.Devices) > 0 {
 		for _, ds := range claim.Status.Devices {
-			if ds.Driver == p.driverName {
-				cond := apimeta.FindStatusCondition(ds.Conditions, "DeviceReady")
-				if cond != nil {
-					return
-				}
-				cond = apimeta.FindStatusCondition(ds.Conditions, "DeviceConflict")
-				if cond != nil {
+			if ds.Driver == bw.plugin.driverName {
+				if apimeta.FindStatusCondition(ds.Conditions, "DeviceReady") != nil ||
+					apimeta.FindStatusCondition(ds.Conditions, "DeviceConflict") != nil {
 					return
 				}
 			}
 		}
 	}
 
-	// Check each allocated device for conflicts
+	// Resolve all underlying physical devices for this claim
+	var members []physicalDeviceKey
 	for _, result := range claim.Status.Allocation.Devices.Results {
-		if result.Driver != p.driverName {
+		if result.Driver != bw.plugin.driverName {
 			continue
 		}
-
-		mapping := p.deviceStore.Get(result.Pool, result.Device)
+		mapping := bw.plugin.deviceStore.Get(result.Pool, result.Device)
 		if mapping == nil {
-			klog.V(2).InfoS("binding-watcher: device not in store, skipping", "claim", claim.Name, "device", result.Device)
+			klog.V(2).InfoS("binding-watcher: device not in store", "claim", claim.Name, "device", result.Device)
 			continue
 		}
-
-		conflict := p.checkDeviceConflict(mapping)
-		if conflict {
-			p.writeBindingCondition(ctx, claim, result, "DeviceConflict", metav1.ConditionTrue,
-				"UnderlyingDeviceAlreadyAllocated",
-				fmt.Sprintf("Device %s contains member(s) already prepared by another composition", result.Device))
-			return
+		for _, m := range mapping.Members {
+			members = append(members, physicalDeviceKey{SourceName: m.SourceName, Device: m.Device})
 		}
 	}
 
-	// No conflicts — set DeviceReady on all our devices
-	p.writeDeviceReadyAll(ctx, claim)
+	// Check for conflicts against reservations and prepared devices
+	conflict, conflictDevice := bw.tryReserve(claim.UID, members)
+	if conflict {
+		klog.InfoS("binding-watcher: conflict detected", "claim", claim.Name, "conflictDevice", conflictDevice)
+		bw.writeDeviceConflict(ctx, claim, conflictDevice)
+		return
+	}
+
+	bw.writeDeviceReadyAll(ctx, claim)
 }
 
-func (p *CompositePlugin) checkDeviceConflict(mapping *store.DeviceMapping) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+// tryReserve attempts to reserve all physical devices for a claim.
+// Returns (true, conflicting device) if any device is already reserved or prepared.
+// On conflict, no reservations are made (atomic — all or nothing).
+func (bw *bindingWatcher) tryReserve(claimUID types.UID, members []physicalDeviceKey) (bool, string) {
+	bw.mu.Lock()
+	defer bw.mu.Unlock()
 
-	for _, prepared := range p.preparedDevices {
-		for _, pd := range prepared {
-			for _, member := range mapping.Members {
-				if pd.SourceName == member.SourceName && pd.Device == member.Device {
-					return true
+	// Check against existing reservations
+	for _, key := range members {
+		if existingUID, exists := bw.reservations[key]; exists && existingUID != claimUID {
+			return true, fmt.Sprintf("%s/%s", key.SourceName, key.Device)
+		}
+	}
+
+	// Check against prepared devices (runtime state from Prepare)
+	bw.plugin.mu.Lock()
+	defer bw.plugin.mu.Unlock()
+	for _, key := range members {
+		for _, prepared := range bw.plugin.preparedDevices {
+			for _, pd := range prepared {
+				if pd.SourceName == key.SourceName && pd.Device == key.Device {
+					return true, fmt.Sprintf("%s/%s", key.SourceName, key.Device)
 				}
 			}
 		}
 	}
-	return false
+
+	// No conflict — register all
+	for _, key := range members {
+		bw.reservations[key] = claimUID
+	}
+	bw.claimDevices[claimUID] = append(bw.claimDevices[claimUID], members...)
+	return false, ""
 }
 
-func (p *CompositePlugin) writeDeviceReadyAll(ctx context.Context, claim *resourceapi.ResourceClaim) {
+func (bw *bindingWatcher) releaseClaim(claimUID types.UID) {
+	bw.mu.Lock()
+	defer bw.mu.Unlock()
+
+	for _, key := range bw.claimDevices[claimUID] {
+		if bw.reservations[key] == claimUID {
+			delete(bw.reservations, key)
+		}
+	}
+	delete(bw.claimDevices, claimUID)
+}
+
+func (bw *bindingWatcher) writeDeviceReadyAll(ctx context.Context, claim *resourceapi.ResourceClaim) {
 	var deviceStatuses []resourceapi.AllocatedDeviceStatus
 	for _, result := range claim.Status.Allocation.Devices.Results {
-		if result.Driver != p.driverName {
+		if result.Driver != bw.plugin.driverName {
 			continue
 		}
 		deviceStatuses = append(deviceStatuses, resourceapi.AllocatedDeviceStatus{
@@ -147,34 +211,42 @@ func (p *CompositePlugin) writeDeviceReadyAll(ctx context.Context, claim *resour
 
 	claimCopy := claim.DeepCopy()
 	claimCopy.Status.Devices = deviceStatuses
-	if _, err := p.claimMgr.Client().ResourceClaims(claim.Namespace).UpdateStatus(ctx, claimCopy, metav1.UpdateOptions{}); err != nil {
+	if _, err := bw.plugin.claimMgr.Client().ResourceClaims(claim.Namespace).UpdateStatus(ctx, claimCopy, metav1.UpdateOptions{}); err != nil {
 		klog.ErrorS(err, "binding-watcher: failed to write DeviceReady", "claim", claim.Name)
+		// Release reservations on write failure so claim can be retried
+		bw.releaseClaim(claim.UID)
 	} else {
-		klog.InfoS("binding-watcher: set DeviceReady for claim", "claim", claim.Name, "devices", len(deviceStatuses))
+		klog.InfoS("binding-watcher: DeviceReady", "claim", claim.Name, "devices", len(deviceStatuses))
 	}
 }
 
-func (p *CompositePlugin) writeBindingCondition(ctx context.Context, claim *resourceapi.ResourceClaim, result resourceapi.DeviceRequestAllocationResult, condType string, status metav1.ConditionStatus, reason, message string) {
-	deviceStatus := resourceapi.AllocatedDeviceStatus{
-		Driver: result.Driver,
-		Pool:   result.Pool,
-		Device: result.Device,
-		Conditions: []metav1.Condition{
-			{
-				Type:               condType,
-				Status:             status,
-				LastTransitionTime: metav1.Now(),
-				Reason:             reason,
-				Message:            message,
+func (bw *bindingWatcher) writeDeviceConflict(ctx context.Context, claim *resourceapi.ResourceClaim, conflictDevice string) {
+	var deviceStatuses []resourceapi.AllocatedDeviceStatus
+	for _, result := range claim.Status.Allocation.Devices.Results {
+		if result.Driver != bw.plugin.driverName {
+			continue
+		}
+		deviceStatuses = append(deviceStatuses, resourceapi.AllocatedDeviceStatus{
+			Driver: result.Driver,
+			Pool:   result.Pool,
+			Device: result.Device,
+			Conditions: []metav1.Condition{
+				{
+					Type:               "DeviceConflict",
+					Status:             metav1.ConditionTrue,
+					LastTransitionTime: metav1.Now(),
+					Reason:             "UnderlyingDeviceAlreadyReserved",
+					Message:            fmt.Sprintf("Physical device %s is reserved by another composition's claim", conflictDevice),
+				},
 			},
-		},
+		})
 	}
 
 	claimCopy := claim.DeepCopy()
-	claimCopy.Status.Devices = append(claimCopy.Status.Devices, deviceStatus)
-	if _, err := p.claimMgr.Client().ResourceClaims(claim.Namespace).UpdateStatus(ctx, claimCopy, metav1.UpdateOptions{}); err != nil {
-		klog.ErrorS(err, "binding-watcher: failed to write condition", "claim", claim.Name, "condition", condType)
+	claimCopy.Status.Devices = deviceStatuses
+	if _, err := bw.plugin.claimMgr.Client().ResourceClaims(claim.Namespace).UpdateStatus(ctx, claimCopy, metav1.UpdateOptions{}); err != nil {
+		klog.ErrorS(err, "binding-watcher: failed to write DeviceConflict", "claim", claim.Name)
 	} else {
-		klog.InfoS("binding-watcher: set condition for claim", "claim", claim.Name, "condition", condType, "device", result.Device)
+		klog.InfoS("binding-watcher: DeviceConflict", "claim", claim.Name, "conflictDevice", conflictDevice)
 	}
 }
