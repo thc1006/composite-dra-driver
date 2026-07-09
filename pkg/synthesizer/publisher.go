@@ -74,6 +74,7 @@ func buildSlices(devices []CompositeDevice) []resourceslice.Slice {
 			devs = append(devs, resourceapi.Device{
 				Name:                    cd.Name,
 				Attributes:              convertAttributes(cd.Attributes),
+				BindingConditions:        []string{"DeviceReady"},
 				BindingFailureConditions: []string{"DeviceConflict"},
 			})
 		}
@@ -122,6 +123,7 @@ func BuildResourceSlices(driverName, nodeName string, compositeDevices []Composi
 				devs = append(devs, resourceapi.Device{
 					Name:                    cd.Name,
 					Attributes:              convertAttributes(cd.Attributes),
+					BindingConditions:        []string{"DeviceReady"},
 					BindingFailureConditions: []string{"DeviceConflict"},
 				})
 			}

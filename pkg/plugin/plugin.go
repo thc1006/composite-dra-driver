@@ -323,6 +323,7 @@ func (p *CompositePlugin) prepareClaim(
 
 	klog.InfoS("plugin: prepared claim", "namespace", claim.Namespace, "claim", claim.Name, "compositeDevices", len(allDevices), "shadowClaims", len(shadows))
 
+	p.reportDeviceReady(ctx, claim)
 	p.notifyStateChange()
 
 	return allDevices, nil
@@ -450,6 +451,42 @@ func (p *CompositePlugin) restoreFromState() {
 		p.shadowClaims[uid] = shadows
 	}
 	klog.InfoS("plugin: restored shadow claim records from state", "count", len(records))
+}
+
+// reportDeviceReady sets DeviceReady=True on all allocated devices, signaling
+// the scheduler that binding can proceed.
+func (p *CompositePlugin) reportDeviceReady(ctx context.Context, claim *resourceapi.ResourceClaim) {
+	if claim.Status.Allocation == nil {
+		return
+	}
+	var deviceStatuses []resourceapi.AllocatedDeviceStatus
+	for _, result := range claim.Status.Allocation.Devices.Results {
+		if result.Driver != p.driverName {
+			continue
+		}
+		deviceStatuses = append(deviceStatuses, resourceapi.AllocatedDeviceStatus{
+			Driver: result.Driver,
+			Pool:   result.Pool,
+			Device: result.Device,
+			Conditions: []metav1.Condition{
+				{
+					Type:               "DeviceReady",
+					Status:             metav1.ConditionTrue,
+					LastTransitionTime: metav1.Now(),
+					Reason:             "PrepareSucceeded",
+					Message:            "Device prepared successfully",
+				},
+			},
+		})
+	}
+	if len(deviceStatuses) == 0 {
+		return
+	}
+	claimCopy := claim.DeepCopy()
+	claimCopy.Status.Devices = deviceStatuses
+	if _, err := p.claimMgr.Client().ResourceClaims(claim.Namespace).UpdateStatus(ctx, claimCopy, metav1.UpdateOptions{}); err != nil {
+		klog.ErrorS(err, "plugin: failed to report DeviceReady", "claim", claim.Name)
+	}
 }
 
 func isDeviceConflict(err error) bool {
