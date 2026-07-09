@@ -188,8 +188,16 @@ func (bw *bindingWatcher) releaseClaim(claimUID types.UID) {
 }
 
 func (bw *bindingWatcher) writeDeviceReadyAll(ctx context.Context, claim *resourceapi.ResourceClaim) {
+	// Re-fetch claim to get latest ResourceVersion
+	latest, err := bw.plugin.claimMgr.Client().ResourceClaims(claim.Namespace).Get(ctx, claim.Name, metav1.GetOptions{})
+	if err != nil {
+		klog.ErrorS(err, "binding-watcher: failed to re-fetch claim for DeviceReady", "claim", claim.Name)
+		bw.releaseClaim(claim.UID)
+		return
+	}
+
 	var deviceStatuses []resourceapi.AllocatedDeviceStatus
-	for _, result := range claim.Status.Allocation.Devices.Results {
+	for _, result := range latest.Status.Allocation.Devices.Results {
 		if result.Driver != bw.plugin.driverName {
 			continue
 		}
@@ -209,11 +217,9 @@ func (bw *bindingWatcher) writeDeviceReadyAll(ctx context.Context, claim *resour
 		})
 	}
 
-	claimCopy := claim.DeepCopy()
-	claimCopy.Status.Devices = deviceStatuses
-	if _, err := bw.plugin.claimMgr.Client().ResourceClaims(claim.Namespace).UpdateStatus(ctx, claimCopy, metav1.UpdateOptions{}); err != nil {
+	latest.Status.Devices = deviceStatuses
+	if _, err := bw.plugin.claimMgr.Client().ResourceClaims(claim.Namespace).UpdateStatus(ctx, latest, metav1.UpdateOptions{}); err != nil {
 		klog.ErrorS(err, "binding-watcher: failed to write DeviceReady", "claim", claim.Name)
-		// Release reservations on write failure so claim can be retried
 		bw.releaseClaim(claim.UID)
 	} else {
 		klog.InfoS("binding-watcher: DeviceReady", "claim", claim.Name, "devices", len(deviceStatuses))
@@ -221,8 +227,15 @@ func (bw *bindingWatcher) writeDeviceReadyAll(ctx context.Context, claim *resour
 }
 
 func (bw *bindingWatcher) writeDeviceConflict(ctx context.Context, claim *resourceapi.ResourceClaim, conflictDevice string) {
+	// Re-fetch claim to get latest ResourceVersion (avoids optimistic concurrency conflict)
+	latest, err := bw.plugin.claimMgr.Client().ResourceClaims(claim.Namespace).Get(ctx, claim.Name, metav1.GetOptions{})
+	if err != nil {
+		klog.ErrorS(err, "binding-watcher: failed to re-fetch claim for DeviceConflict", "claim", claim.Name)
+		return
+	}
+
 	var deviceStatuses []resourceapi.AllocatedDeviceStatus
-	for _, result := range claim.Status.Allocation.Devices.Results {
+	for _, result := range latest.Status.Allocation.Devices.Results {
 		if result.Driver != bw.plugin.driverName {
 			continue
 		}
@@ -242,9 +255,8 @@ func (bw *bindingWatcher) writeDeviceConflict(ctx context.Context, claim *resour
 		})
 	}
 
-	claimCopy := claim.DeepCopy()
-	claimCopy.Status.Devices = deviceStatuses
-	if _, err := bw.plugin.claimMgr.Client().ResourceClaims(claim.Namespace).UpdateStatus(ctx, claimCopy, metav1.UpdateOptions{}); err != nil {
+	latest.Status.Devices = deviceStatuses
+	if _, err := bw.plugin.claimMgr.Client().ResourceClaims(claim.Namespace).UpdateStatus(ctx, latest, metav1.UpdateOptions{}); err != nil {
 		klog.ErrorS(err, "binding-watcher: failed to write DeviceConflict", "claim", claim.Name)
 	} else {
 		klog.InfoS("binding-watcher: DeviceConflict", "claim", claim.Name, "conflictDevice", conflictDevice)
