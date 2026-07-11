@@ -10,40 +10,39 @@ The performance difference is significant: mismatched GPU-NIC pairs can lose up 
 
 ## Node Topology
 
+```mermaid
+block-beta
+    columns 2
+
+    block:numa0["NUMA Zone 0 — PCIe Root 0x00"]:1
+        columns 2
+        GPU0["GPU-0"] NIC0["NIC-0\nRail0\n10.0.x.x"]
+        GPU1["GPU-1"] NIC1["NIC-1\nRail1\n10.1.x.x"]
+        GPU2["GPU-2"] NIC2["NIC-2\nRail2\n10.2.x.x"]
+        GPU3["GPU-3"] NIC3["NIC-3\nRail3\n10.3.x.x"]
+    end
+
+    block:numa1["NUMA Zone 1 — PCIe Root 0x80"]:1
+        columns 2
+        GPU4["GPU-4"] NIC4["NIC-4\nRail0\n10.0.x.x"]
+        GPU5["GPU-5"] NIC5["NIC-5\nRail1\n10.1.x.x"]
+        GPU6["GPU-6"] NIC6["NIC-6\nRail2\n10.2.x.x"]
+        GPU7["GPU-7"] NIC7["NIC-7\nRail3\n10.3.x.x"]
+    end
+
+    GPU0 --> NIC0
+    GPU1 --> NIC1
+    GPU2 --> NIC2
+    GPU3 --> NIC3
+    GPU4 --> NIC4
+    GPU5 --> NIC5
+    GPU6 --> NIC6
+    GPU7 --> NIC7
 ```
-                          Node (8 GPU-NIC pairs, e.g. B200)
-    +-------------------------------------------------------------+
-    |                                                             |
-    |   NUMA Zone 0                      NUMA Zone 1              |
-    |  +=======================+       +=======================+  |
-    |  |                       |       |                       |  |
-    |  |  PCIe Root 0x00       |       |  PCIe Root 0x80       |  |
-    |  |  +-----+  +-----+    |       |  +-----+  +-----+    |  |
-    |  |  |GPU-0|  |NIC-0|    |       |  |GPU-4|  |NIC-4|    |  |
-    |  |  |     |--|Rail0|    |       |  |     |--|Rail0|    |  |
-    |  |  +-----+  +-----+    |       |  +-----+  +-----+    |  |
-    |  |  +-----+  +-----+    |       |  +-----+  +-----+    |  |
-    |  |  |GPU-1|  |NIC-1|    |       |  |GPU-5|  |NIC-5|    |  |
-    |  |  |     |--|Rail1|    |       |  |     |--|Rail1|    |  |
-    |  |  +-----+  +-----+    |       |  +-----+  +-----+    |  |
-    |  |  +-----+  +-----+    |       |  +-----+  +-----+    |  |
-    |  |  |GPU-2|  |NIC-2|    |       |  |GPU-6|  |NIC-6|    |  |
-    |  |  |     |--|Rail2|    |       |  |     |--|Rail2|    |  |
-    |  |  +-----+  +-----+    |       |  +-----+  +-----+    |  |
-    |  |  +-----+  +-----+    |       |  +-----+  +-----+    |  |
-    |  |  |GPU-3|  |NIC-3|    |       |  |GPU-7|  |NIC-7|    |  |
-    |  |  |     |--|Rail3|    |       |  |     |--|Rail3|    |  |
-    |  |  +-----+  +-----+    |       |  +-----+  +-----+    |  |
-    |  |                       |       |                       |  |
-    |  +=======================+       +=======================+  |
-    |                                                             |
-    |  Network Rails:  Rail0 = 10.0.x.x    Rail1 = 10.1.x.x      |
-    |                  Rail2 = 10.2.x.x    Rail3 = 10.3.x.x      |
-    |                                                             |
-    |  Drivers:  GPU -> gpu.nvidia.com    NIC -> dra.net           |
-    |  Pairing:  matchAttribute on resource.kubernetes.io/pcieRoot |
-    +-------------------------------------------------------------+
-```
+
+> **Drivers:** GPU → `gpu.nvidia.com` · NIC → `dra.net`
+> **Pairing:** `matchAttribute` on `resource.kubernetes.io/pcieRoot`
+> **Request sizes:** 2-pair → one NUMA zone · 4-pair → fill one zone · 8-pair → entire node
 
 Each GPU has exactly one adjacent NIC. They share a PCIe root. The NIC is connected to a specific rail subnet. Getting this pairing right is essential for RDMA performance.
 

@@ -120,17 +120,22 @@ This tells the scheduler: find a GPU and a NIC that both have the same `pcieRoot
 4. **Scheduler writes allocation** — Updates `status.allocation` on the ResourceClaim with the specific devices and node.
 5. **Kubelet prepares** — Calls the driver's `NodePrepareResources` gRPC method. The driver sets up the device and returns CDI device references. Containers start with device access.
 
-```
-  Driver (DaemonSet)          API Server              Scheduler              Kubelet
-       |                         |                       |                     |
-       |-- ResourceSlice ------->|                       |                     |
-       |                         |<-- ResourceClaim ----|                     |
-       |                         |                       |-- evaluate claim    |
-       |                         |                       |   find devices      |
-       |                         |                       |   check constraints |
-       |                         |<-- allocation result -|                     |
-       |                         |-- NodePrepareResources ------------------>|
-       |<--- prepare devices ----|                       |              start containers
+```mermaid
+sequenceDiagram
+    participant D as Driver (DaemonSet)
+    participant A as API Server
+    participant S as Scheduler
+    participant K as Kubelet
+
+    D->>A: Publish ResourceSlice<br/>(devices + attributes)
+    Note over A: User creates ResourceClaim
+    S->>A: Read ResourceSlices
+    S->>S: Evaluate CEL selectors<br/>Check matchAttribute constraints<br/>Pick node
+    S->>A: Write allocation result
+    A->>K: NodePrepareResources
+    K->>D: Prepare devices
+    D-->>K: CDI device IDs
+    K->>K: Start containers with devices
 ```
 
 ---
