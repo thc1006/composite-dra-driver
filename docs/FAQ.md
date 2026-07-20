@@ -52,7 +52,7 @@ Per-rail policy rules (`from 10.X.0.0/16 lookup table 10X`) divert same-rail tra
 
 ### Is the routing config coupled to dranet?
 
-Yes. `NICParams`, `Route`, `Rule` structs mirror dranet's internal format. Tracked for decoupling in Issue #9 — plan is to make driver config opaque/templated so the composite driver doesn't parse it.
+No — it was decoupled in PR #32. The `DeviceParamsResolver` reads an external ConfigMap, matches device attributes against entries using CEL selectors, and generates opaque parameters via Go template substitution. The composite driver never interprets the param content. See `charts/composite-dra-driver/examples/` for ConfigMap templates.
 
 ## Performance
 
