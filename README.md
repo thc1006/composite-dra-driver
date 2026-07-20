@@ -31,6 +31,79 @@ Underlying Drivers                    Composite Driver                      User
 
 **Shadow Claims Pattern**: On `PrepareResourceClaims`, the composite driver creates real ResourceClaims ("shadow claims") for each underlying driver with pre-filled allocation results, then calls their gRPC sockets to prepare hardware. Neither nvidia nor dranet checks if claims are in `pod.spec.resourceClaims` — validated on real hardware.
 
+## What Gets Published
+
+The composite driver watches ResourceSlices from underlying drivers and publishes new composite ResourceSlices. Here's what the transformation looks like on a node with 8× H100 GPUs and 8× ConnectX RDMA NICs:
+
+**Source: GPU driver (`gpu.nvidia.com`)**
+```yaml
+# One of 8 GPU devices in the source ResourceSlice
+- name: gpu-7
+  attributes:
+    addressingMode:             { string: HMM }
+    architecture:               { string: Hopper }
+    brand:                      { string: Nvidia }
+    cudaComputeCapability:      { version: 9.0.0 }
+    driverVersion:              { version: 580.126.20 }
+    productName:                { string: "NVIDIA H100 80GB HBM3" }
+    resource.kubernetes.io/pciBusID:   { string: "0000:a4:00.0" }
+    resource.kubernetes.io/pcieRoot:   { string: pci0000:a0 }       # ← pairing key
+    uuid:                       { string: GPU-7c664fc3-... }
+  capacity:
+    memory:                     { value: 81559Mi }
+```
+
+**Source: NIC driver (`dra.net`)**
+```yaml
+# One of 8 RDMA NIC devices in the source ResourceSlice
+- name: pci-0000-a3-00-0
+  attributes:
+    dra.net/ifName:             { string: enp163s0 }
+    dra.net/ipv4:               { string: "10.0.0.5/16" }
+    dra.net/mac:                { string: "02:00:02:bc:50:f4" }
+    dra.net/mtu:                { int: 9000 }
+    dra.net/numaNode:           { int: 0 }
+    dra.net/pciAddress:         { string: "0000:a3:00.0" }
+    dra.net/pciDevice:          { string: ConnectX Family mlx5Gen Virtual Function }
+    dra.net/pciVendor:          { string: Mellanox Technologies }
+    dra.net/rdma:               { bool: true }                      # ← CEL filter: rdma == true
+    dra.net/sriov:              { bool: false }
+    dra.net/state:              { string: up }
+    resource.kubernetes.io/pcieRoot:   { string: pci0000:a0 }       # ← same root → paired with gpu-7
+```
+
+**Output: Composite driver (`composite.dra.example.io`)**
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceSlice
+spec:
+  driver: composite.dra.example.io
+  nodeName: worker-3
+  pool:
+    name: composite.dra.example.io-worker-3-gpu-nic-pair
+    resourceSliceCount: 1
+  devices:
+  - name: gpu-7--pci-0000-a3-00-0                         # concatenated source device names
+    attributes:
+      # Forwarded from GPU (prefixed with source name "gpu/")
+      gpu/pciBusID:             { string: "0000:a4:00.0" }
+      gpu/pcieRoot:             { string: pci0000:a0 }
+      # Forwarded from NIC (prefixed with source name "nic/")
+      nic/pciAddress:           { string: "0000:a3:00.0" }
+      nic/numaNode:             { int: 0 }
+      nic/rdma:                 { bool: true }
+      nic/ipv4:                 { string: "10.0.0.5/16" }
+      # Constraint attribute promoted to top level
+      resource.kubernetes.io/pcieRoot:  { string: pci0000:a0 }
+      # Auto-injected composite metadata
+      composite/compositionName:        { string: gpu-nic-pair }
+      composite/numaNode:               { int: 0 }
+  - name: gpu-6--pci-0000-ad-00-0
+    # ... (7 more pairs, one per matching pcieRoot)
+```
+
+Only attributes listed in `forwardAttributes` config appear in the composite ResourceSlice. The full source attribute set (GPU uuid, NIC vendor, etc.) is preserved internally for shadow claim construction.
+
 ## Quick Start
 
 ### Install
@@ -154,18 +227,9 @@ Opaque driver params (routes, gateways, MTU, etc.) are provided via an external 
 
 ## Observability
 
-Both binaries serve Prometheus metrics on `/metrics` (port 8080, configurable). Key metrics:
+Both binaries serve 16 Prometheus metrics on `/metrics` (port 8080, configurable) — gauges for device/claim counts, histograms for prepare/synthesis latency, counters for errors and webhook activity. Kubernetes Events are emitted on ResourceClaims for the prepare/unprepare lifecycle. All logging uses structured `klog.InfoS`/`ErrorS`.
 
-| Metric | What it tells you |
-|--------|-------------------|
-| `composite_dra_synthesis_devices_total` | Composite devices published per composition per node |
-| `composite_dra_claims_active` | Composite claims currently prepared (allocated) |
-| `composite_dra_prepare_duration_seconds` | End-to-end Prepare latency (pod startup contribution) |
-| `composite_dra_webhook_errors_total` | Webhook mutation failures by stage |
-
-Kubernetes Events (`PrepareStarted`, `PrepareCompleted`, `PrepareFailed`, `UnprepareCompleted`) are emitted on ResourceClaims. All logging uses structured `klog.InfoS`/`ErrorS` with key-value pairs.
-
-Enable Prometheus scraping: `--set metrics.serviceMonitor.enabled=true` in Helm values. See [Observability reference](docs/OBSERVABILITY.md) for the full metrics table, PromQL examples, scraping setup (OpenShift + vanilla K8s), and limitations.
+Enable scraping: `--set metrics.serviceMonitor.enabled=true`. See [Observability reference](docs/OBSERVABILITY.md) for the full metric catalog, PromQL examples, and scraping setup.
 
 ## Requirements
 
@@ -193,8 +257,6 @@ Enable Prometheus scraping: `--set metrics.serviceMonitor.enabled=true` in Helm 
 - [FAQ](docs/FAQ.md) — architecture decisions, scheduling, networking, performance
 - [HA Design](docs/HA-DESIGN.md) — failure scenarios, DaemonSet vs Deployment HA
 - [Status](docs/STATUS.md) — implementation status and validation evidence
-- [Agents](docs/AGENTS.md) — instructions for AI coding agents
-
 ## License
 
 Apache 2.0

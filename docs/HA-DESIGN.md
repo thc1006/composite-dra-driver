@@ -149,7 +149,7 @@ func (p *CompositePlugin) reconcileOrphans(ctx context.Context) {
 | Concern | Implementation |
 |---------|---------------|
 | State persistence across restarts | BoltDB at hostPath ✅ done |
-| Shadow claim orphan cleanup | Reconciler loop (5-min interval) — **TODO** |
+| Shadow claim orphan cleanup | Reconciler loop (5-min interval) ✅ done (`pkg/plugin/reconciler.go`) |
 | Graceful shutdown (unprepare in-flight) | Context cancellation in main.go ✅ done |
 | Master node scheduling | DaemonSet tolerations ✅ done |
 | System-critical priority | priorityClassName: system-node-critical ✅ done |
@@ -167,5 +167,5 @@ The HA story is mostly handled by K8s primitives (DaemonSet, OwnerReference GC, 
 1. ✅ BoltDB persistence for crash recovery
 2. ✅ Control-plane tolerations
 3. ✅ system-node-critical priority
-4. **TODO** Orphan shadow claim reconciler (5-min loop)
+4. ✅ Orphan shadow claim reconciler (5-min loop, `pkg/plugin/reconciler.go`)
 5. ✅ Graceful shutdown via context cancellation

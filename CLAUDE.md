@@ -98,6 +98,48 @@ Config YAML (`/etc/composite-dra/config.yaml` in-cluster) defines:
 
 Table-driven unit tests. Helpers in pairer_test.go (`strAttr`, `intAttr`, `boolAttr`) for building device attributes. No integration tests — those require a K8s cluster with DRA feature gate. Test files: config validation, pairer algorithm, device store thread-safety, publisher splitting, device params resolver, webhook claim builder, webhook reconciler.
 
+### Cluster Testing
+
+```bash
+export KUBECONFIG=<path-to-cluster-kubeconfig>
+
+# Deploy via Helm
+helm install composite charts/composite-dra-driver \
+  -n composite-dra-system \
+  -f charts/composite-dra-driver/values-poseidon.yaml \
+  --set webhook.enabled=true \
+  --set webhook.tls.certManager.issuerRef.name=composite-dra-selfsigned
+
+# Label namespace for webhook
+oc label ns <ns> composite.dra/webhook-enabled=true
+
+# Test pod
+oc apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test
+  namespace: <ns>
+spec:
+  containers:
+  - name: test
+    image: quay.io/dagray/rdma-tools:tiny
+    command: ["sleep", "300"]
+    resources:
+      requests:
+        composite.dra/gpu-nic-pair: "2"
+      limits:
+        composite.dra/gpu-nic-pair: "2"
+EOF
+
+# Verify
+oc get resourceclaims -n <ns>                     # shadow claims visible
+oc exec test -- ip -br addr                        # net0, net1 with IPs
+oc exec test -- rdma link show                     # mlx5 devices
+oc logs -l app.kubernetes.io/component=driver \
+  -n composite-dra-system | grep "plugin:"         # prepare timing
+```
+
 ## Observability
 
 Both binaries serve `/metrics` on port 8080 (configurable via `--metrics-port`).
@@ -136,3 +178,10 @@ Reference docs in `docs/`:
 | `FAQ.md` | Frequently asked questions |
 | `HA-DESIGN.md` | High-availability design considerations |
 | `STATUS.md` | Project status (Phase 1-3 complete) |
+
+## References
+
+- [kubernetes/kubernetes](https://github.com/kubernetes/kubernetes) — kubeletplugin at `staging/src/k8s.io/dynamic-resource-allocation/`, DRA APIs at `staging/src/k8s.io/api/resource/v1/`
+- [kubernetes-sigs/dranet](https://github.com/kubernetes-sigs/dranet) — dranet DRA driver (NRI hooks, PodConfigStore)
+- [openshift-psap/dra-rail-admission-webhook](https://github.com/openshift-psap/dra-rail-admission-webhook) — old webhook (reference for VF/IPAM implementation)
+- [kubernetes-sigs/dra-driver-nvidia-gpu](https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu) — nvidia DRA driver (CDI, checkpoint)
