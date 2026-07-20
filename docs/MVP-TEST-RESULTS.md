@@ -1,6 +1,6 @@
 # Composite DRA Driver — MVP Test Results
 
-**Poseidon Cluster** · 2026-06-05 · OCP 4.21 / K8s 1.34 · 4× 8×H100 GPU nodes
+**Poseidon Cluster** · OCP 4.21 / K8s 1.34 · 4× 8×H100 GPU nodes · see [`git log`](https://github.com/openshift-psap/composite-dra-driver/commits/main/docs/MVP-TEST-RESULTS.md) for test date
 
 > github.com/openshift-psap/composite-dra-driver
 >
@@ -486,7 +486,7 @@ Shadow claims pattern works end-to-end on real hardware. Generic — no nvidia/d
 
 ---
 
-## Status at Time of Test (2026-06-05)
+## Status at Time of Test
 
 Items marked ✓ were validated during this MVP test. Items below were open at test time — see [STATUS.md](STATUS.md) for current state.
 
@@ -582,4 +582,4 @@ Webhook is optional. cert-manager handles TLS. 2 replicas for HA.
 
 ## MVP: Pass ✓
 
-Poseidon cluster · 2026-06-05
+Poseidon cluster · see git history for test date

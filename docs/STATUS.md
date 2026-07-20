@@ -1,6 +1,6 @@
 # Composite DRA Driver — Status Report
 
-**Date:** 2026-05-31 (point-in-time snapshot — all phases now complete)
+**Snapshot from initial implementation** · see [`git log docs/STATUS.md`](https://github.com/openshift-psap/composite-dra-driver/commits/main/docs/STATUS.md) for dates
 **Session:** composite-dra-driver
 
 ## Goal
