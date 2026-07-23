@@ -158,7 +158,7 @@ func podPrefix(pod *corev1.Pod) string {
 func compositionTemplateName(podName, deviceClassName string) string {
 	name := fmt.Sprintf("%s-%s", podName, deviceClassName)
 	if len(name) > 63 {
-		name = name[:63]
+		name = strings.TrimRight(name[:63], "-")
 	}
 	return name
 }
@@ -243,7 +243,7 @@ func (m *Mutator) buildPatches(pod *corev1.Pod, matches []resourceMatch, claims 
 	for i, claim := range claims {
 		claimName := fmt.Sprintf("composite-%s", claim.deviceClassName)
 		if len(claimName) > 63 {
-			claimName = claimName[:63]
+			claimName = strings.TrimRight(claimName[:63], "-")
 		}
 
 		claimRef := corev1.PodResourceClaim{

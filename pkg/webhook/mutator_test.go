@@ -260,3 +260,87 @@ func TestMutate_OnlyMatchingResources(t *testing.T) {
 		}
 	}
 }
+
+func TestCompositionTemplateName(t *testing.T) {
+	tests := []struct {
+		name           string
+		podName        string
+		deviceClass    string
+		wantMaxLen     int
+		wantNoTrailing bool
+	}{
+		{
+			name:        "short name, no truncation",
+			podName:     "my-pod",
+			deviceClass: "gpu",
+		},
+		{
+			name:        "exactly 63 chars",
+			podName:     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			deviceClass: "bbbbbbbbbbbbbb",
+		},
+		{
+			name:        "over 63, truncation on alphanumeric",
+			podName:     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			deviceClass: "composite-gpu-nic-pair",
+		},
+		{
+			name:        "over 63, truncation lands on dash",
+			podName:     "llm-d-pd-d-x2-p-tp1-d-tp4-p-x2-kserve-759d8cccc5",
+			deviceClass: "composite-gpu-nic-pair",
+		},
+		{
+			name:        "over 63, multiple trailing dashes",
+			podName:     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa---",
+			deviceClass: "bbbbbbbbbbbbbbbbbbbb",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := compositionTemplateName(tt.podName, tt.deviceClass)
+			if len(got) > 63 {
+				t.Errorf("name too long: %d chars: %s", len(got), got)
+			}
+			if got[len(got)-1] == '-' {
+				t.Errorf("name ends with dash: %s", got)
+			}
+		})
+	}
+}
+
+func TestPodPrefix(t *testing.T) {
+	tests := []struct {
+		name         string
+		pod          *corev1.Pod
+		wantNoDash   bool
+		wantContains string
+	}{
+		{
+			name: "uses Name when set",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-pod"},
+			},
+			wantContains: "my-pod",
+		},
+		{
+			name: "strips trailing dash from GenerateName",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{GenerateName: "my-deploy-"},
+			},
+			wantNoDash: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := podPrefix(tt.pod)
+			if tt.wantNoDash && got[len(got)-1] == '-' {
+				t.Errorf("podPrefix ends with dash: %s", got)
+			}
+			if tt.wantContains != "" && got != tt.wantContains {
+				t.Errorf("got %s, want %s", got, tt.wantContains)
+			}
+		})
+	}
+}

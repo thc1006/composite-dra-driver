@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -26,7 +27,7 @@ func shadowClaimName(compositeClaimName string, member *store.DeviceMember) stri
 	prefix := hex.EncodeToString(h[:4])
 	name := fmt.Sprintf("shadow-%s-%s-%s", prefix, member.SourceName, member.Device)
 	if len(name) > 63 {
-		name = name[:63]
+		name = strings.TrimRight(name[:63], "-")
 	}
 	return name
 }
