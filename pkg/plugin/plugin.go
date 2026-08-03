@@ -41,6 +41,7 @@ type shadowRecord struct {
 	driverName  string
 	composition string
 	info        *shadow.ShadowClaimInfo
+	created     bool // this Prepare attempt created the shadow, rather than adopting an existing one
 }
 
 var _ kubeletplugin.DRAPlugin = (*CompositePlugin)(nil)
@@ -167,10 +168,12 @@ func (p *CompositePlugin) prepareClaim(
 		wg.Add(1)
 		go func(w *memberWork) {
 			defer wg.Done()
+			created := true
 			shadowInfo, err := p.claimMgr.Create(ctx, claim, &w.member, w.allocResult.Request, w.opaqueConfig)
 			if err != nil {
 				if errors.IsAlreadyExists(err) {
 					klog.V(2).InfoS("plugin: shadow claim already exists, fetching existing", "driver", w.member.Driver, "device", w.member.Device)
+					created = false
 					shadowInfo, err = p.claimMgr.Get(ctx, claim, &w.member)
 					if err != nil {
 						w.err = fmt.Errorf("get existing shadow for %s/%s: %w", w.member.Driver, w.member.Device, err)
@@ -181,7 +184,7 @@ func (p *CompositePlugin) prepareClaim(
 					return
 				}
 			}
-			w.shadow = shadowRecord{driverName: w.member.Driver, composition: composition, info: shadowInfo}
+			w.shadow = shadowRecord{driverName: w.member.Driver, composition: composition, info: shadowInfo, created: created}
 		}(w)
 	}
 	wg.Wait()
@@ -293,7 +296,7 @@ func (p *CompositePlugin) unprepareClaim(
 			klog.ErrorS(err, "plugin: unprepare shadow failed", "driver", sr.driverName, "shadow", sr.info.Name)
 			errs = append(errs, err)
 		}
-		if err := p.claimMgr.Delete(ctx, sr.info.Namespace, sr.info.Name); err != nil {
+		if err := p.claimMgr.Delete(ctx, sr.info); err != nil {
 			klog.ErrorS(err, "plugin: delete shadow claim failed", "shadow", sr.info.Name)
 			errs = append(errs, err)
 		}
@@ -332,8 +335,14 @@ func (p *CompositePlugin) unprepareClaim(
 
 func (p *CompositePlugin) cleanupShadows(ctx context.Context, shadows []shadowRecord) {
 	for _, sr := range shadows {
+		// Only roll back shadows this Prepare attempt created. A shadow adopted via
+		// AlreadyExists may already be prepared and in use by a running workload, so
+		// tearing it down on a later member's failure would break that workload.
+		if !sr.created {
+			continue
+		}
 		_ = p.grpcClient.Unprepare(ctx, sr.driverName, sr.info)
-		_ = p.claimMgr.Delete(ctx, sr.info.Namespace, sr.info.Name)
+		_ = p.claimMgr.Delete(ctx, sr.info)
 	}
 }
 
