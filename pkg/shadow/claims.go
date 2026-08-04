@@ -273,24 +273,38 @@ func (m *ClaimManager) Delete(ctx context.Context, info *ShadowClaimInfo) error 
 	return nil
 }
 
-// DeleteForCompositeClaim deletes all shadow claims owned by a composite claim.
-func (m *ClaimManager) DeleteForCompositeClaim(ctx context.Context, namespace, compositeClaimUID string) error {
+// AdoptedShadow identifies a shadow claim found on the API server together with the
+// underlying driver it was prepared on, so a caller can unprepare it before deleting.
+type AdoptedShadow struct {
+	Info   ShadowClaimInfo
+	Driver string
+}
+
+// ListForCompositeClaim returns the shadow claims owned by a composite claim, each with
+// the underlying driver taken from its allocation. The caller uses this to tear down
+// shadows the plugin no longer tracks in memory (a Prepare rollback kept them, or they
+// outlived a restart that never checkpointed them): unprepare each before deleting so
+// the underlying resource is released, not just the shadow object.
+func (m *ClaimManager) ListForCompositeClaim(ctx context.Context, namespace, compositeClaimUID string) ([]AdoptedShadow, error) {
 	labelSelector := fmt.Sprintf("app.kubernetes.io/managed-by=%s,composite-claim-uid=%s", m.driverName, compositeClaimUID)
 	list, err := m.client.ResourceClaims(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: labelSelector,
 	})
 	if err != nil {
-		return fmt.Errorf("list shadow claims for composite %s: %w", compositeClaimUID, err)
+		return nil, fmt.Errorf("list shadow claims for composite %s: %w", compositeClaimUID, err)
 	}
 
-	var errs []error
-	for _, claim := range list.Items {
-		if delErr := m.Delete(ctx, &ShadowClaimInfo{Namespace: namespace, Name: claim.Name, UID: string(claim.UID)}); delErr != nil {
-			errs = append(errs, delErr)
+	out := make([]AdoptedShadow, 0, len(list.Items))
+	for i := range list.Items {
+		claim := &list.Items[i]
+		driver := ""
+		if claim.Status.Allocation != nil && len(claim.Status.Allocation.Devices.Results) > 0 {
+			driver = claim.Status.Allocation.Devices.Results[0].Driver
 		}
+		out = append(out, AdoptedShadow{
+			Info:   ShadowClaimInfo{Namespace: claim.Namespace, Name: claim.Name, UID: string(claim.UID)},
+			Driver: driver,
+		})
 	}
-	if len(errs) > 0 {
-		return fmt.Errorf("failed to delete %d shadow claims: %v", len(errs), errs)
-	}
-	return nil
+	return out, nil
 }

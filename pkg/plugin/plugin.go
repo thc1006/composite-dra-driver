@@ -39,7 +39,7 @@ type shadowClaimManager interface {
 	Create(ctx context.Context, compositeClaim *resourceapi.ResourceClaim, member *store.DeviceMember, requestName string, opaqueConfig []byte) (*shadow.ShadowClaimInfo, error)
 	Get(ctx context.Context, compositeClaim *resourceapi.ResourceClaim, member *store.DeviceMember, requestName string) (*shadow.ShadowClaimInfo, error)
 	Delete(ctx context.Context, info *shadow.ShadowClaimInfo) error
-	DeleteForCompositeClaim(ctx context.Context, namespace, compositeClaimUID string) error
+	ListForCompositeClaim(ctx context.Context, namespace, compositeClaimUID string) ([]shadow.AdoptedShadow, error)
 }
 
 // CompositePlugin implements kubeletplugin.DRAPlugin for the composite driver.
@@ -320,6 +320,7 @@ func (p *CompositePlugin) prepareClaim(
 
 	p.mu.Lock()
 	p.shadowClaims[claim.UID] = shadows
+	p.setActiveMetricsForCompositionLocked(composition)
 	p.mu.Unlock()
 
 	if err := p.persistShadows(string(claim.UID), claim.Namespace, shadows); err != nil {
@@ -328,8 +329,6 @@ func (p *CompositePlugin) prepareClaim(
 
 	elapsed := time.Since(prepareStart)
 	metrics.PrepareDurationSeconds.WithLabelValues(composition).Observe(elapsed.Seconds())
-	metrics.ClaimsActive.WithLabelValues(composition).Inc()
-	metrics.ShadowClaimsActive.WithLabelValues(composition).Add(float64(len(shadows)))
 
 	p.recorder.Eventf(claim, corev1.EventTypeNormal, "PrepareCompleted",
 		"Prepared %d composite devices with %d shadow claims in %s", len(allDevices), len(shadows), elapsed.Round(time.Millisecond))
@@ -363,12 +362,29 @@ func (p *CompositePlugin) unprepareClaim(
 			remaining = append(remaining, sr)
 			continue
 		}
-		metrics.ShadowClaimsActive.WithLabelValues(sr.composition).Dec()
 	}
 
 	if len(shadows) == 0 {
-		if err := p.claimMgr.DeleteForCompositeClaim(ctx, claim.Namespace, string(claim.UID)); err != nil {
+		// No in-memory record, but shadows may still exist on the API server: a Prepare
+		// rollback kept one whose Unprepare failed, or they outlived a restart with no
+		// checkpoint. Unprepare each before deleting so the underlying resource is
+		// released, not just the shadow object left with a dangling preparation.
+		listed, err := p.claimMgr.ListForCompositeClaim(ctx, claim.Namespace, string(claim.UID))
+		if err != nil {
 			errs = append(errs, err)
+		}
+		for _, s := range listed {
+			info := &shadow.ShadowClaimInfo{Namespace: s.Info.Namespace, Name: s.Info.Name, UID: s.Info.UID}
+			if s.Driver != "" {
+				if uerr := p.grpcClient.Unprepare(ctx, s.Driver, info); uerr != nil {
+					klog.ErrorS(uerr, "plugin: unprepare orphaned shadow failed, keeping it", "shadow", info.Name)
+					errs = append(errs, uerr)
+					continue
+				}
+			}
+			if derr := p.claimMgr.Delete(ctx, info); derr != nil {
+				errs = append(errs, derr)
+			}
 		}
 	}
 
@@ -383,6 +399,9 @@ func (p *CompositePlugin) unprepareClaim(
 		}
 		p.mu.Lock()
 		p.shadowClaims[claim.UID] = remaining
+		if shadowCount > 0 {
+			p.setActiveMetricsForCompositionLocked(shadows[0].composition)
+		}
 		p.mu.Unlock()
 		return fmt.Errorf("%d errors during unprepare: %v", len(errs), errs)
 	}
@@ -395,11 +414,10 @@ func (p *CompositePlugin) unprepareClaim(
 	}
 	p.mu.Lock()
 	delete(p.shadowClaims, claim.UID)
-	p.mu.Unlock()
-
 	if shadowCount > 0 {
-		metrics.ClaimsActive.WithLabelValues(shadows[0].composition).Dec()
+		p.setActiveMetricsForCompositionLocked(shadows[0].composition)
 	}
+	p.mu.Unlock()
 
 	claimRef := &corev1.ObjectReference{
 		APIVersion: "resource.k8s.io/v1",
@@ -450,6 +468,25 @@ func (p *CompositePlugin) cleanupShadows(ctx context.Context, shadows []shadowRe
 			klog.ErrorS(err, "plugin: rollback delete shadow failed", "shadow", sr.info.Name)
 		}
 	}
+}
+
+// setActiveMetricsForCompositionLocked recomputes the active-claim and active-shadow
+// gauges for one composition from the authoritative in-memory map. Setting the absolute
+// value keeps the gauges correct across retries and restarts, where per-attempt
+// Inc/Dec drifts: a restart repopulates the map while the gauges start at zero, so the
+// next Unprepare would decrement them negative, and an idempotent Unprepare retry would
+// decrement a second time. The caller holds p.mu.
+func (p *CompositePlugin) setActiveMetricsForCompositionLocked(composition string) {
+	claims, shadows := 0, 0
+	for _, recs := range p.shadowClaims {
+		if len(recs) == 0 || recs[0].composition != composition {
+			continue
+		}
+		claims++
+		shadows += len(recs)
+	}
+	metrics.ClaimsActive.WithLabelValues(composition).Set(float64(claims))
+	metrics.ShadowClaimsActive.WithLabelValues(composition).Set(float64(shadows))
 }
 
 func (p *CompositePlugin) persistShadows(uid, namespace string, shadows []shadowRecord) error {
@@ -503,6 +540,14 @@ func (p *CompositePlugin) restoreFromState() {
 			})
 		}
 		p.shadowClaims[uid] = shadows
+	}
+	seen := make(map[string]bool)
+	for _, recs := range p.shadowClaims {
+		if len(recs) == 0 || seen[recs[0].composition] {
+			continue
+		}
+		seen[recs[0].composition] = true
+		p.setActiveMetricsForCompositionLocked(recs[0].composition)
 	}
 	klog.InfoS("plugin: restored shadow claim records from state", "count", len(records))
 }
