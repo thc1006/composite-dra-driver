@@ -17,21 +17,40 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/klog/v2"
+	drapbv1 "k8s.io/kubelet/pkg/apis/dra/v1"
 
 	"github.com/openshift-psap/composite-dra-driver/pkg/metrics"
 	"github.com/openshift-psap/composite-dra-driver/pkg/shadow"
 	"github.com/openshift-psap/composite-dra-driver/pkg/store"
 )
 
+// shadowPreparer prepares and unprepares a shadow claim on an underlying DRA driver.
+// The plugin depends on this narrow interface (satisfied by *GRPCClient) so the
+// prepare and rollback paths can be exercised without a live gRPC socket.
+type shadowPreparer interface {
+	Prepare(ctx context.Context, driverName string, claim *shadow.ShadowClaimInfo) (*drapbv1.NodePrepareResourceResponse, error)
+	Unprepare(ctx context.Context, driverName string, claim *shadow.ShadowClaimInfo) error
+}
+
+// shadowClaimManager creates, adopts, and deletes shadow ResourceClaims. It is the
+// narrow interface the plugin needs (satisfied by *shadow.ClaimManager), kept small
+// so failure paths can be driven with a fake in tests.
+type shadowClaimManager interface {
+	Create(ctx context.Context, compositeClaim *resourceapi.ResourceClaim, member *store.DeviceMember, requestName string, opaqueConfig []byte) (*shadow.ShadowClaimInfo, error)
+	Get(ctx context.Context, compositeClaim *resourceapi.ResourceClaim, member *store.DeviceMember) (*shadow.ShadowClaimInfo, error)
+	Delete(ctx context.Context, info *shadow.ShadowClaimInfo) error
+	DeleteForCompositeClaim(ctx context.Context, namespace, compositeClaimUID string) error
+}
+
 // CompositePlugin implements kubeletplugin.DRAPlugin for the composite driver.
 type CompositePlugin struct {
-	driverName      string
-	deviceStore     *store.DeviceStore
-	claimMgr        *shadow.ClaimManager
-	paramsResolver  *shadow.DeviceParamsResolver
-	grpcClient      *GRPCClient
-	stateStore      *store.StateStore
-	recorder        record.EventRecorder
+	driverName     string
+	deviceStore    *store.DeviceStore
+	claimMgr       shadowClaimManager
+	paramsResolver *shadow.DeviceParamsResolver
+	grpcClient     shadowPreparer
+	stateStore     *store.StateStore
+	recorder       record.EventRecorder
 
 	mu           sync.Mutex
 	shadowClaims map[types.UID][]shadowRecord
@@ -49,9 +68,9 @@ var _ kubeletplugin.DRAPlugin = (*CompositePlugin)(nil)
 func NewCompositePlugin(
 	driverName string,
 	deviceStore *store.DeviceStore,
-	claimMgr *shadow.ClaimManager,
+	claimMgr shadowClaimManager,
 	paramsResolver *shadow.DeviceParamsResolver,
-	grpcClient *GRPCClient,
+	grpcClient shadowPreparer,
 	stateStore *store.StateStore,
 	recorder record.EventRecorder,
 ) *CompositePlugin {
@@ -102,15 +121,15 @@ func (p *CompositePlugin) HandleError(ctx context.Context, err error, msg string
 
 // memberWork holds the inputs and outputs for one member's parallel prepare.
 type memberWork struct {
-	pairIdx     int
-	memberIdx   int
-	member      store.DeviceMember
-	allocResult resourceapi.DeviceRequestAllocationResult
+	pairIdx      int
+	memberIdx    int
+	member       store.DeviceMember
+	allocResult  resourceapi.DeviceRequestAllocationResult
 	opaqueConfig []byte
 
-	shadow   shadowRecord
-	cdiIDs   []string
-	err      error
+	shadow shadowRecord
+	cdiIDs []string
+	err    error
 }
 
 func (p *CompositePlugin) prepareClaim(
@@ -204,7 +223,9 @@ func (p *CompositePlugin) prepareClaim(
 		}
 	}
 	if firstErr != nil {
-		p.cleanupShadows(ctx, shadows)
+		// Phase 1 failure: no gRPC Prepare has run yet, so the created shadows can be
+		// deleted directly.
+		p.cleanupShadows(ctx, shadows, false)
 		return nil, firstErr
 	}
 
@@ -233,7 +254,9 @@ func (p *CompositePlugin) prepareClaim(
 		if w.err != nil {
 			p.recorder.Eventf(claim, corev1.EventTypeWarning, "PrepareFailed",
 				"gRPC prepare failed for driver %s: %v", w.shadow.driverName, w.err)
-			p.cleanupShadows(ctx, shadows)
+			// Phase 2 failure: gRPC Prepare has run, so unprepare before deleting and keep
+			// any shadow that fails to unprepare.
+			p.cleanupShadows(ctx, shadows, true)
 			return nil, w.err
 		}
 	}
@@ -245,8 +268,8 @@ func (p *CompositePlugin) prepareClaim(
 		dev, ok := devicesByPair[key]
 		if !ok {
 			dev = &kubeletplugin.Device{
-				Requests: []string{w.allocResult.Request},
-				PoolName: w.allocResult.Pool,
+				Requests:   []string{w.allocResult.Request},
+				PoolName:   w.allocResult.Pool,
 				DeviceName: w.allocResult.Device,
 			}
 			devicesByPair[key] = dev
@@ -333,7 +356,22 @@ func (p *CompositePlugin) unprepareClaim(
 	return nil
 }
 
-func (p *CompositePlugin) cleanupShadows(ctx context.Context, shadows []shadowRecord) {
+// cleanupShadows rolls back the shadow claims a failed Prepare attempt created.
+//
+// Before gRPC Prepare has run (prepared=false) the shadows were never prepared on an
+// underlying driver, so they are deleted directly. After gRPC Prepare has run
+// (prepared=true) an underlying preparation may exist, so each shadow is unprepared
+// first and deleted only when that succeeds. A shadow whose Unprepare fails is left in
+// place: its API object and owner reference stay as the handle a Prepare retry adopts
+// (Create -> AlreadyExists -> Get) to release the underlying resource, instead of
+// deleting the shadow and leaking the resource with nothing left to unprepare it. This
+// is the Prepare-rollback side of the resource leak tracked in #64.
+//
+// A kept shadow is recovered when the kubelet retries Prepare, which re-adopts it and
+// re-drives the (idempotent, per the DRA contract) underlying Prepare. If the pod is
+// instead deleted before a retry succeeds, teardown falls to the claim's Unprepare
+// path rather than this one.
+func (p *CompositePlugin) cleanupShadows(ctx context.Context, shadows []shadowRecord, prepared bool) {
 	for _, sr := range shadows {
 		// Only roll back shadows this Prepare attempt created. A shadow adopted via
 		// AlreadyExists may already be prepared and in use by a running workload, so
@@ -341,8 +379,17 @@ func (p *CompositePlugin) cleanupShadows(ctx context.Context, shadows []shadowRe
 		if !sr.created {
 			continue
 		}
-		_ = p.grpcClient.Unprepare(ctx, sr.driverName, sr.info)
-		_ = p.claimMgr.Delete(ctx, sr.info)
+		if prepared {
+			if err := p.grpcClient.Unprepare(ctx, sr.driverName, sr.info); err != nil {
+				// A gRPC error is an ambiguous outcome: the underlying resource may still
+				// be prepared. Keep the shadow so a retry can drive its Unprepare again.
+				klog.ErrorS(err, "plugin: rollback unprepare failed, keeping shadow for retry", "driver", sr.driverName, "shadow", sr.info.Name)
+				continue
+			}
+		}
+		if err := p.claimMgr.Delete(ctx, sr.info); err != nil {
+			klog.ErrorS(err, "plugin: rollback delete shadow failed", "shadow", sr.info.Name)
+		}
 	}
 }
 
