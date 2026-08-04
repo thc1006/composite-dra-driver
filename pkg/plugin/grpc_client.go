@@ -101,7 +101,9 @@ func (c *GRPCClient) Unprepare(ctx context.Context, driverName string, claim *sh
 
 	claimResp, ok := resp.Claims[claim.UID]
 	if !ok {
-		return nil
+		// The DRA contract requires one result per input claim, so a missing entry is
+		// a protocol violation, not proof that teardown succeeded.
+		return fmt.Errorf("driver %s did not return an unprepare response for claim %s", driverName, claim.UID)
 	}
 	if claimResp.Error != "" {
 		return fmt.Errorf("driver %s unprepare failed for claim %s: %s", driverName, claim.UID, claimResp.Error)

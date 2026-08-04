@@ -322,7 +322,9 @@ func (p *CompositePlugin) prepareClaim(
 	p.shadowClaims[claim.UID] = shadows
 	p.mu.Unlock()
 
-	p.persistShadows(claim, shadows)
+	if err := p.persistShadows(string(claim.UID), claim.Namespace, shadows); err != nil {
+		klog.ErrorS(err, "plugin: persist shadow state failed", "uid", claim.UID)
+	}
 
 	elapsed := time.Since(prepareStart)
 	metrics.PrepareDurationSeconds.WithLabelValues(composition).Observe(elapsed.Seconds())
@@ -343,37 +345,60 @@ func (p *CompositePlugin) unprepareClaim(
 ) error {
 	p.mu.Lock()
 	shadows := p.shadowClaims[claim.UID]
-	delete(p.shadowClaims, claim.UID)
 	p.mu.Unlock()
 
 	var errs []error
+	var remaining []shadowRecord
 	shadowCount := len(shadows)
 	for _, sr := range shadows {
 		if err := p.grpcClient.Unprepare(ctx, sr.driverName, sr.info); err != nil {
 			klog.ErrorS(err, "plugin: unprepare shadow failed", "driver", sr.driverName, "shadow", sr.info.Name)
 			errs = append(errs, err)
+			remaining = append(remaining, sr)
+			continue
 		}
 		if err := p.claimMgr.Delete(ctx, sr.info); err != nil {
 			klog.ErrorS(err, "plugin: delete shadow claim failed", "shadow", sr.info.Name)
 			errs = append(errs, err)
+			remaining = append(remaining, sr)
+			continue
 		}
+		metrics.ShadowClaimsActive.WithLabelValues(sr.composition).Dec()
 	}
 
 	if len(shadows) == 0 {
 		if err := p.claimMgr.DeleteForCompositeClaim(ctx, claim.Namespace, string(claim.UID)); err != nil {
-			klog.ErrorS(err, "plugin: cleanup orphaned shadows failed", "uid", claim.UID)
+			errs = append(errs, err)
 		}
 	}
 
-	p.deleteShadowState(string(claim.UID))
-
 	if len(errs) > 0 {
+		// Keep the recovery state for the shadows that did not unprepare, so a retry
+		// can drive them again. Persist it durably first, so a restart replays only the
+		// remaining shadows and not the ones already unprepared and deleted.
+		if len(remaining) > 0 {
+			if err := p.persistShadows(string(claim.UID), claim.Namespace, remaining); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		p.mu.Lock()
+		p.shadowClaims[claim.UID] = remaining
+		p.mu.Unlock()
 		return fmt.Errorf("%d errors during unprepare: %v", len(errs), errs)
 	}
 
+	// Everything unprepared. Delete the durable checkpoint before the in-memory record,
+	// and report a failure, so a restart cannot resurrect the claim from a stale
+	// checkpoint. A retry re-runs the (now idempotent) unprepare and delete.
+	if err := p.deleteShadowState(string(claim.UID)); err != nil {
+		return fmt.Errorf("delete shadow state for claim %s: %w", claim.UID, err)
+	}
+	p.mu.Lock()
+	delete(p.shadowClaims, claim.UID)
+	p.mu.Unlock()
+
 	if shadowCount > 0 {
 		metrics.ClaimsActive.WithLabelValues(shadows[0].composition).Dec()
-		metrics.ShadowClaimsActive.WithLabelValues(shadows[0].composition).Sub(float64(shadowCount))
 	}
 
 	claimRef := &corev1.ObjectReference{
@@ -427,9 +452,9 @@ func (p *CompositePlugin) cleanupShadows(ctx context.Context, shadows []shadowRe
 	}
 }
 
-func (p *CompositePlugin) persistShadows(claim *resourceapi.ResourceClaim, shadows []shadowRecord) {
+func (p *CompositePlugin) persistShadows(uid, namespace string, shadows []shadowRecord) error {
 	if p.stateStore == nil {
-		return
+		return nil
 	}
 	entries := make([]store.ShadowEntry, len(shadows))
 	for i, sr := range shadows {
@@ -441,22 +466,18 @@ func (p *CompositePlugin) persistShadows(claim *resourceapi.ResourceClaim, shado
 			Composition: sr.composition,
 		}
 	}
-	if err := p.stateStore.SaveShadows(store.ShadowRecord{
-		CompositeClaimUID: string(claim.UID),
-		Namespace:         claim.Namespace,
+	return p.stateStore.SaveShadows(store.ShadowRecord{
+		CompositeClaimUID: uid,
+		Namespace:         namespace,
 		Shadows:           entries,
-	}); err != nil {
-		klog.ErrorS(err, "plugin: persist shadow state failed", "uid", claim.UID)
-	}
+	})
 }
 
-func (p *CompositePlugin) deleteShadowState(compositeClaimUID string) {
+func (p *CompositePlugin) deleteShadowState(compositeClaimUID string) error {
 	if p.stateStore == nil {
-		return
+		return nil
 	}
-	if err := p.stateStore.DeleteShadows(compositeClaimUID); err != nil {
-		klog.ErrorS(err, "plugin: delete shadow state failed", "uid", compositeClaimUID)
-	}
+	return p.stateStore.DeleteShadows(compositeClaimUID)
 }
 
 func (p *CompositePlugin) restoreFromState() {
