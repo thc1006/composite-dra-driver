@@ -22,6 +22,10 @@ rules:
   - apiGroups: ["resource.k8s.io"]
     resources: ["resourceclaims/status"]
     verbs: ["get", "update", "patch"]
+  # status.allocation/reservedFor need resourceclaims/binding on 1.36 (granular status authz, beta on)
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims/binding"]
+    verbs: ["update", "patch"]
   - apiGroups: ["resource.k8s.io"]
     resources: ["resourceclaimtemplates"]
     verbs: ["get", "list", "watch", "create", "update", "delete"]
