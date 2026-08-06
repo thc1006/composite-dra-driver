@@ -85,7 +85,7 @@ func (m *ClaimManager) Create(
 	if opaqueConfig != nil {
 		allocationResult.Devices.Config = []resourceapi.DeviceAllocationConfiguration{
 			{
-				Source: resourceapi.AllocationConfigSourceClaim,
+				Source:   resourceapi.AllocationConfigSourceClaim,
 				Requests: []string{requestName},
 				DeviceConfiguration: resourceapi.DeviceConfiguration{
 					Opaque: &resourceapi.OpaqueDeviceConfiguration{
@@ -160,43 +160,53 @@ func (m *ClaimManager) Create(
 // composite claim deleted and re-created under the same name reuses the name but
 // gets a new UID, so a shadow left from the previous incarnation must not be
 // adopted as an idempotent Prepare. Every mismatch fails closed.
-func validateShadowOwnership(shadow, compositeClaim *resourceapi.ResourceClaim, member *store.DeviceMember) error {
+func validateShadowOwnership(shadow, compositeClaim *resourceapi.ResourceClaim, member *store.DeviceMember, driverName, requestName string) error {
 	if shadow.DeletionTimestamp != nil {
 		return fmt.Errorf("shadow claim %s is terminating", shadow.Name)
+	}
+	if got := shadow.Labels["app.kubernetes.io/managed-by"]; got != driverName {
+		return fmt.Errorf("shadow claim %s is not managed by %q (got %q)", shadow.Name, driverName, got)
 	}
 	if got := shadow.Labels["composite-claim-uid"]; got != string(compositeClaim.UID) {
 		return fmt.Errorf("shadow claim %s belongs to composite claim UID %q, not %q", shadow.Name, got, compositeClaim.UID)
 	}
+	// The reconciler resolves the parent through the owner reference's name, so the whole
+	// reference must match, not just the UID; a shadow with the right UID but a wrong
+	// name would be adopted here and then treated as an orphan there.
 	owned := false
 	for _, ref := range shadow.OwnerReferences {
-		if ref.UID == compositeClaim.UID {
+		if ref.APIVersion == "resource.k8s.io/v1" && ref.Kind == "ResourceClaim" &&
+			ref.Name == compositeClaim.Name && ref.UID == compositeClaim.UID {
 			owned = true
 			break
 		}
 	}
 	if !owned {
-		return fmt.Errorf("shadow claim %s is not owned by composite claim %s", shadow.Name, compositeClaim.UID)
+		return fmt.Errorf("shadow claim %s is not owned by composite claim %s/%s", shadow.Name, compositeClaim.Name, compositeClaim.UID)
 	}
-	// The name is a hash and can collide, so confirm the shadow actually allocates
-	// this member's underlying device before adopting it.
-	if !shadowAllocatesMember(shadow, member) {
-		return fmt.Errorf("shadow claim %s does not allocate %s/%s/%s", shadow.Name, member.Driver, member.Pool, member.Device)
+	// The name is a hash and can collide, so confirm the shadow actually allocates this
+	// member's underlying device for this request before adopting it.
+	if !shadowAllocatesMember(shadow, member, requestName) {
+		return fmt.Errorf("shadow claim %s does not allocate request %q for %s/%s/%s", shadow.Name, requestName, member.Driver, member.Pool, member.Device)
 	}
 	return nil
 }
 
-// shadowAllocatesMember reports whether the shadow's status allocation targets the
-// given underlying device.
-func shadowAllocatesMember(shadow *resourceapi.ResourceClaim, member *store.DeviceMember) bool {
+// shadowAllocatesMember reports whether the shadow's status allocation targets exactly
+// this member's underlying device for this request. Binding the request name, and
+// requiring a single result, keeps two composite requests that resolve to the same
+// underlying device (the overlapping pairs in #69) from sharing one shadow.
+func shadowAllocatesMember(shadow *resourceapi.ResourceClaim, member *store.DeviceMember, requestName string) bool {
 	if shadow.Status.Allocation == nil {
 		return false
 	}
-	for _, r := range shadow.Status.Allocation.Devices.Results {
-		if r.Driver == member.Driver && r.Pool == member.Pool && r.Device == member.Device {
-			return true
-		}
+	results := shadow.Status.Allocation.Devices.Results
+	if len(results) != 1 {
+		return false
 	}
-	return false
+	r := results[0]
+	return r.Request == requestName &&
+		r.Driver == member.Driver && r.Pool == member.Pool && r.Device == member.Device
 }
 
 // Get fetches an existing shadow claim and confirms it belongs to the given
@@ -205,6 +215,7 @@ func (m *ClaimManager) Get(
 	ctx context.Context,
 	compositeClaim *resourceapi.ResourceClaim,
 	member *store.DeviceMember,
+	requestName string,
 ) (*ShadowClaimInfo, error) {
 	shadowName := shadowClaimName(compositeClaim.Name, member)
 
@@ -213,7 +224,7 @@ func (m *ClaimManager) Get(
 		return nil, fmt.Errorf("get shadow claim %s: %w", shadowName, err)
 	}
 
-	if err := validateShadowOwnership(existing, compositeClaim, member); err != nil {
+	if err := validateShadowOwnership(existing, compositeClaim, member, m.driverName, requestName); err != nil {
 		return nil, err
 	}
 

@@ -37,7 +37,7 @@ type shadowPreparer interface {
 // so failure paths can be driven with a fake in tests.
 type shadowClaimManager interface {
 	Create(ctx context.Context, compositeClaim *resourceapi.ResourceClaim, member *store.DeviceMember, requestName string, opaqueConfig []byte) (*shadow.ShadowClaimInfo, error)
-	Get(ctx context.Context, compositeClaim *resourceapi.ResourceClaim, member *store.DeviceMember) (*shadow.ShadowClaimInfo, error)
+	Get(ctx context.Context, compositeClaim *resourceapi.ResourceClaim, member *store.DeviceMember, requestName string) (*shadow.ShadowClaimInfo, error)
 	Delete(ctx context.Context, info *shadow.ShadowClaimInfo) error
 	DeleteForCompositeClaim(ctx context.Context, namespace, compositeClaimUID string) error
 }
@@ -193,7 +193,7 @@ func (p *CompositePlugin) prepareClaim(
 				if errors.IsAlreadyExists(err) {
 					klog.V(2).InfoS("plugin: shadow claim already exists, fetching existing", "driver", w.member.Driver, "device", w.member.Device)
 					created = false
-					shadowInfo, err = p.claimMgr.Get(ctx, claim, &w.member)
+					shadowInfo, err = p.claimMgr.Get(ctx, claim, &w.member, w.allocResult.Request)
 					if err != nil {
 						w.err = fmt.Errorf("get existing shadow for %s/%s: %w", w.member.Driver, w.member.Device, err)
 						return

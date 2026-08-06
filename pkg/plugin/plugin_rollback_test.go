@@ -53,7 +53,7 @@ func (f *fakeClaimMgr) Create(context.Context, *resourceapi.ResourceClaim, *stor
 	return nil, nil
 }
 
-func (f *fakeClaimMgr) Get(context.Context, *resourceapi.ResourceClaim, *store.DeviceMember) (*shadow.ShadowClaimInfo, error) {
+func (f *fakeClaimMgr) Get(context.Context, *resourceapi.ResourceClaim, *store.DeviceMember, string) (*shadow.ShadowClaimInfo, error) {
 	return nil, nil
 }
 
