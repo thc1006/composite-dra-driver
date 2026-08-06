@@ -63,10 +63,13 @@ func (c *GRPCClient) Prepare(ctx context.Context, driverName string, claim *shad
 	if err != nil {
 		return nil, fmt.Errorf("NodePrepareResources on %s: %w", driverName, err)
 	}
+	if resp == nil {
+		return nil, fmt.Errorf("driver %s returned a nil NodePrepareResources response", driverName)
+	}
 
 	claimResp, ok := resp.Claims[claim.UID]
-	if !ok {
-		return nil, fmt.Errorf("driver %s did not return response for claim %s", driverName, claim.UID)
+	if !ok || claimResp == nil {
+		return nil, fmt.Errorf("driver %s did not return a response for claim %s", driverName, claim.UID)
 	}
 	if claimResp.Error != "" {
 		return nil, fmt.Errorf("driver %s prepare failed for claim %s: %s", driverName, claim.UID, claimResp.Error)
@@ -98,9 +101,12 @@ func (c *GRPCClient) Unprepare(ctx context.Context, driverName string, claim *sh
 	if err != nil {
 		return fmt.Errorf("NodeUnprepareResources on %s: %w", driverName, err)
 	}
+	if resp == nil {
+		return fmt.Errorf("driver %s returned a nil NodeUnprepareResources response", driverName)
+	}
 
 	claimResp, ok := resp.Claims[claim.UID]
-	if !ok {
+	if !ok || claimResp == nil {
 		// The DRA contract requires one result per input claim, so a missing entry is
 		// a protocol violation, not proof that teardown succeeded.
 		return fmt.Errorf("driver %s did not return an unprepare response for claim %s", driverName, claim.UID)
