@@ -278,6 +278,10 @@ func (m *ClaimManager) Delete(ctx context.Context, info *ShadowClaimInfo) error 
 type AdoptedShadow struct {
 	Info   ShadowClaimInfo
 	Driver string
+	// HasAllocation is true when the shadow carries a status allocation. A shadow with
+	// no allocation was never prepared on an underlying driver, so it holds no resource
+	// and can be deleted directly rather than unprepared.
+	HasAllocation bool
 }
 
 // ListForCompositeClaim returns the shadow claims owned by a composite claim, each with
@@ -297,13 +301,15 @@ func (m *ClaimManager) ListForCompositeClaim(ctx context.Context, namespace, com
 	out := make([]AdoptedShadow, 0, len(list.Items))
 	for i := range list.Items {
 		claim := &list.Items[i]
+		hasAlloc := claim.Status.Allocation != nil && len(claim.Status.Allocation.Devices.Results) > 0
 		driver := ""
-		if claim.Status.Allocation != nil && len(claim.Status.Allocation.Devices.Results) > 0 {
+		if hasAlloc {
 			driver = claim.Status.Allocation.Devices.Results[0].Driver
 		}
 		out = append(out, AdoptedShadow{
-			Info:   ShadowClaimInfo{Namespace: claim.Namespace, Name: claim.Name, UID: string(claim.UID)},
-			Driver: driver,
+			Info:          ShadowClaimInfo{Namespace: claim.Namespace, Name: claim.Name, UID: string(claim.UID)},
+			Driver:        driver,
+			HasAllocation: hasAlloc,
 		})
 	}
 	return out, nil

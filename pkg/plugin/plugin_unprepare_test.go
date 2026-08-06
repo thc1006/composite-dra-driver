@@ -40,6 +40,7 @@ func newPluginWithFakes(ss *store.StateStore) (*CompositePlugin, *fakePreparer, 
 	fp := &fakePreparer{}
 	fc := &fakeClaimMgr{}
 	p := &CompositePlugin{
+		driverName:   "composite.example.com",
 		grpcClient:   fp,
 		claimMgr:     fc,
 		stateStore:   ss,
@@ -162,7 +163,7 @@ func TestUnprepareClaimFallbackUnpreparesBeforeDelete(t *testing.T) {
 	ss := openStateStore(t)
 	p, fp, fc := newPluginWithFakes(ss)
 	fc.listForComposite = []shadow.AdoptedShadow{
-		{Info: shadow.ShadowClaimInfo{Namespace: "ns", Name: "orphan-a", UID: "oa"}, Driver: "drv-a"},
+		{Info: shadow.ShadowClaimInfo{Namespace: "ns", Name: "orphan-a", UID: "oa"}, Driver: "drv-a", HasAllocation: true},
 	}
 
 	// No entry in p.shadowClaims for this uid, so the len(shadows)==0 fallback runs.
@@ -183,7 +184,7 @@ func TestUnprepareClaimFallbackKeepsShadowOnUnprepareFailure(t *testing.T) {
 	p, fp, fc := newPluginWithFakes(ss)
 	fp.unprepareErr = map[string]error{"orphan-a": errors.New("socket timeout")}
 	fc.listForComposite = []shadow.AdoptedShadow{
-		{Info: shadow.ShadowClaimInfo{Namespace: "ns", Name: "orphan-a", UID: "oa"}, Driver: "drv-a"},
+		{Info: shadow.ShadowClaimInfo{Namespace: "ns", Name: "orphan-a", UID: "oa"}, Driver: "drv-a", HasAllocation: true},
 	}
 
 	if err := p.unprepareClaim(context.Background(), nsObj("uid-orphan")); err == nil {
@@ -194,6 +195,56 @@ func TestUnprepareClaimFallbackKeepsShadowOnUnprepareFailure(t *testing.T) {
 	}
 	if len(fc.deleted) != 0 {
 		t.Errorf("deleted = %v, want none (shadow kept after a failed Unprepare)", fc.deleted)
+	}
+}
+
+// A fallback shadow with no status allocation was never prepared (Prepare runs only after
+// Create returns), so it holds no underlying resource. The fallback deletes it directly to
+// unblock the claim's teardown rather than unpreparing or wedging it. This is the
+// incomplete-shadow case from #70.
+func TestUnprepareClaimFallbackDeletesNeverPreparedShadow(t *testing.T) {
+	ss := openStateStore(t)
+	p, fp, fc := newPluginWithFakes(ss)
+	fc.listForComposite = []shadow.AdoptedShadow{
+		{Info: shadow.ShadowClaimInfo{Namespace: "ns", Name: "orphan-a", UID: "oa"}, Driver: "", HasAllocation: false},
+	}
+
+	if err := p.unprepareClaim(context.Background(), nsObj("uid-orphan")); err != nil {
+		t.Fatalf("unprepare: %v", err)
+	}
+	if len(fp.unprepared) != 0 {
+		t.Errorf("unprepared = %v, want none (a never-prepared shadow must not be unprepared)", fp.unprepared)
+	}
+	if !sortedEqual(fc.deleted, []string{"orphan-a"}) {
+		t.Errorf("deleted = %v, want orphan-a deleted (never prepared, safe to remove)", fc.deleted)
+	}
+}
+
+// A fallback shadow that does carry an allocation but whose driver is unusable (empty, or
+// the composite driver itself) may hold an underlying preparation, so the fallback keeps it
+// and returns an error rather than a fail-open delete.
+func TestUnprepareClaimFallbackFailsClosedOnBadDriver(t *testing.T) {
+	for _, tc := range []struct{ name, driver string }{
+		{"empty driver with allocation", ""},
+		{"self driver", "composite.example.com"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ss := openStateStore(t)
+			p, fp, fc := newPluginWithFakes(ss)
+			fc.listForComposite = []shadow.AdoptedShadow{
+				{Info: shadow.ShadowClaimInfo{Namespace: "ns", Name: "orphan-a", UID: "oa"}, Driver: tc.driver, HasAllocation: true},
+			}
+
+			if err := p.unprepareClaim(context.Background(), nsObj("uid-orphan")); err == nil {
+				t.Fatalf("want an error for an allocation with an unusable driver %q", tc.driver)
+			}
+			if len(fp.unprepared) != 0 {
+				t.Errorf("unprepared = %v, want none (an unusable driver must not be called)", fp.unprepared)
+			}
+			if len(fc.deleted) != 0 {
+				t.Errorf("deleted = %v, want none (the shadow must be kept, not fail-open deleted)", fc.deleted)
+			}
+		})
 	}
 }
 

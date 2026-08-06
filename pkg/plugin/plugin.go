@@ -375,12 +375,28 @@ func (p *CompositePlugin) unprepareClaim(
 		}
 		for _, s := range listed {
 			info := &shadow.ShadowClaimInfo{Namespace: s.Info.Namespace, Name: s.Info.Name, UID: s.Info.UID}
-			if s.Driver != "" {
-				if uerr := p.grpcClient.Unprepare(ctx, s.Driver, info); uerr != nil {
-					klog.ErrorS(uerr, "plugin: unprepare orphaned shadow failed, keeping it", "shadow", info.Name)
-					errs = append(errs, uerr)
-					continue
+			if !s.HasAllocation {
+				// No status allocation means gRPC Prepare never ran for this shadow (it
+				// only runs after Create returns), so it holds no underlying resource.
+				// Delete the orphaned object so the claim's teardown is not blocked; this
+				// is the incomplete-shadow case from #70.
+				if derr := p.claimMgr.Delete(ctx, info); derr != nil {
+					errs = append(errs, derr)
 				}
+				continue
+			}
+			if s.Driver == "" || s.Driver == p.driverName {
+				// The allocation is present but its driver is unusable (empty, or the
+				// composite driver itself, which must not be called through its own
+				// socket). The underlying resource may be prepared, so keep the shadow and
+				// surface an error rather than a fail-open delete.
+				errs = append(errs, fmt.Errorf("orphaned shadow %s has an allocation but an unusable driver %q; keeping it", info.Name, s.Driver))
+				continue
+			}
+			if uerr := p.grpcClient.Unprepare(ctx, s.Driver, info); uerr != nil {
+				klog.ErrorS(uerr, "plugin: unprepare orphaned shadow failed, keeping it", "shadow", info.Name)
+				errs = append(errs, uerr)
+				continue
 			}
 			if derr := p.claimMgr.Delete(ctx, info); derr != nil {
 				errs = append(errs, derr)
