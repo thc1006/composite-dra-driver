@@ -132,6 +132,35 @@ type memberWork struct {
 	err    error
 }
 
+// rejectDuplicateMembers fails closed when two composite devices in the same
+// claim resolve to the same underlying (driver, pool, device) member. The shadow
+// claim name is keyed on the member alone, so two work items for one member would
+// collapse onto a single shadow: the second Create gets AlreadyExists and adopts
+// the first, and the same underlying device (with its CDI IDs) ends up satisfying
+// both composite devices while the caller believes it got two. Sharing an
+// underlying device is not modeled yet, so reject the allocation before any shadow
+// is created rather than silently over-allocating.
+func rejectDuplicateMembers(work []*memberWork) error {
+	type memberKey struct {
+		driver, pool, device string
+	}
+	type occurrence struct {
+		compositePool, compositeDevice string
+	}
+	seen := make(map[memberKey]occurrence, len(work))
+	for _, w := range work {
+		key := memberKey{driver: w.member.Driver, pool: w.member.Pool, device: w.member.Device}
+		cur := occurrence{compositePool: w.allocResult.Pool, compositeDevice: w.allocResult.Device}
+		if prev, found := seen[key]; found {
+			return fmt.Errorf("composite devices %s/%s and %s/%s share underlying member %s/%s/%s; sharing an underlying device is not supported",
+				prev.compositePool, prev.compositeDevice, cur.compositePool, cur.compositeDevice,
+				key.driver, key.pool, key.device)
+		}
+		seen[key] = cur
+	}
+	return nil
+}
+
 func (p *CompositePlugin) prepareClaim(
 	ctx context.Context,
 	claim *resourceapi.ResourceClaim,
@@ -178,6 +207,11 @@ func (p *CompositePlugin) prepareClaim(
 			})
 		}
 		pairOrdinal++
+	}
+
+	if err := rejectDuplicateMembers(work); err != nil {
+		p.recorder.Eventf(claim, corev1.EventTypeWarning, "PrepareFailed", "%v", err)
+		return nil, err
 	}
 
 	// Phase 1: Create all shadow claims in parallel
