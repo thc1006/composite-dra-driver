@@ -40,17 +40,21 @@ func (f *fakePreparer) Unprepare(_ context.Context, _ string, claim *shadow.Shad
 	return f.unprepareErr[claim.Name]
 }
 
-// fakeClaimMgr records delete calls and returns configurable errors keyed by shadow
-// claim name. It satisfies shadowClaimManager.
+// fakeClaimMgr records create and delete calls and returns configurable errors keyed
+// by shadow claim name. It satisfies shadowClaimManager.
 type fakeClaimMgr struct {
 	mu                  sync.Mutex
 	deleteErr           map[string]error
+	created             []string
 	deleted             []string
 	deletedForComposite []string
 }
 
-func (f *fakeClaimMgr) Create(context.Context, *resourceapi.ResourceClaim, *store.DeviceMember, string, []byte) (*shadow.ShadowClaimInfo, error) {
-	return nil, nil
+func (f *fakeClaimMgr) Create(_ context.Context, _ *resourceapi.ResourceClaim, member *store.DeviceMember, _ string, _ []byte) (*shadow.ShadowClaimInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.created = append(f.created, member.Device)
+	return &shadow.ShadowClaimInfo{Namespace: "ns", Name: "shadow-" + member.Device, UID: "uid-" + member.Device}, nil
 }
 
 func (f *fakeClaimMgr) Get(context.Context, *resourceapi.ResourceClaim, *store.DeviceMember, string) (*shadow.ShadowClaimInfo, error) {
